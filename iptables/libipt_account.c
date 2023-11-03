@@ -8,17 +8,17 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#ifdef IPTABLES_VERSION
-#include <iptables.h>
-#elif defined XTABLES_VERSION
+//#ifdef IPTABLES_VERSION
+//#include <iptables.h>
+//#elif defined XTABLES_VERSION
 #include <xtables.h>
-#else
-#error IPTABLES_VERSION nor XTABLES_VERSION not defined.
-#endif
+//#else
+//#error IPTABLES_VERSION nor XTABLES_VERSION not defined.
+//#endif
 #include <string.h>
 #include <getopt.h>
 
-#include "../kernel/ipt_account.h"
+#include <linux/netfilter_ipv4/ipt_account.h>
 
 #ifndef HIPQUAD
 #define HIPQUAD(addr) \
@@ -311,13 +311,13 @@ static void save(
 
   struct t_ipt_account_info *info = (struct t_ipt_account_info *)match->data;
   
-  printf("--aaddr ");
+  printf(" --aaddr ");
   printf("%u.%u.%u.%u/%u.%u.%u.%u ",
        HIPQUAD(info->network),
        HIPQUAD(info->netmask)
          );
   
-  printf("--aname %s ", info->name);
+  printf("--aname %s", info->name);
   if (info->shortlisting)
     printf("--ashort ");
 }

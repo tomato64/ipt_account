@@ -28,7 +28,7 @@ MODULE_LICENSE("GPL");
 #else
 #include <linux/netfilter_ipv4/ip_tables.h>
 #endif
-#include "ipt_account.h"
+#include <linux/netfilter_ipv4/ipt_account.h>
 
 /* Compatibility, should replace all HIPQUAD with %pI4 and use network byte order not host byte order */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)
@@ -627,7 +627,7 @@ checkentry(
       up(&ipt_account_mutex);
 #endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,35)
-      return -EINVAL;
+      return 0;
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,23)
       return true;
 #else
@@ -696,7 +696,9 @@ checkentry(
 #else
   up(&ipt_account_mutex);
 #endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,23)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,35)
+   return 0;
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,23)
   return true;
 #else
   return 1;
@@ -906,7 +908,7 @@ static struct seq_operations ipt_account_seq_ops = {
 
 static ssize_t ipt_account_proc_write(struct file *file, const char __user *input, size_t size, loff_t *ofs)
 {
-  char buffer[1024];
+  char *buffer;
   struct proc_dir_entry *pde = PDE(file->f_dentry->d_inode);
   struct t_ipt_account_table *table = pde->data;
 
@@ -914,11 +916,17 @@ static ssize_t ipt_account_proc_write(struct file *file, const char __user *inpu
   struct t_ipt_account_stats_long l;
   struct t_ipt_account_stats_short s;
 
+  buffer = kmalloc(1024, GFP_ATOMIC);
+  if (!buffer)
+	return -ENOMEM;
+
 #ifdef DEBUG_IPT_ACCOUNT  
   if (debug) printk(KERN_DEBUG "ipt_account [ipt_account_proc_write]: name = %s.\n", table->name);
 #endif  
-  if (copy_from_user(buffer, input, 1024))
+  if (copy_from_user(buffer, input, 1024)) {
+    kfree(buffer);
     return -EFAULT;
+  }
   buffer[1023] = '\0';
 
   if (!strncmp(buffer, "reset\n", 6)) {
@@ -1018,9 +1026,11 @@ static ssize_t ipt_account_proc_write(struct file *file, const char __user *inpu
     /*
      * We don't understand what user have just wrote.
      */
+    kfree(buffer);
     return -EIO;
   }
 
+  kfree(buffer);
   return size;
 }
 
