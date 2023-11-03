@@ -11,7 +11,7 @@
 #include <linux/vmalloc.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <linux/time.h>
+#include <linux/time64.h>
 #include <linux/ip.h>
 #include <linux/in.h>
 
@@ -22,6 +22,75 @@
 MODULE_AUTHOR("Piotr Gasidlo <quaker@barbara.eu.org>");
 MODULE_DESCRIPTION("Traffic accounting module");
 MODULE_LICENSE("GPL");
+
+struct proc_dir_entry {
+        /*
+         * number of callers into module in progress;
+         * negative -> it's going away RSN
+         */
+        atomic_t in_use;
+        refcount_t refcnt;
+        struct list_head pde_openers;   /* who did ->open, but not ->release */
+        /* protects ->pde_openers and all struct pde_opener instances */
+        spinlock_t pde_unload_lock;
+        struct completion *pde_unload_completion;
+        const struct inode_operations *proc_iops;
+        union {
+                const struct proc_ops *proc_ops;
+                const struct file_operations *proc_dir_ops;
+        };
+        const struct dentry_operations *proc_dops;
+        union {
+                const struct seq_operations *seq_ops;
+                int (*single_show)(struct seq_file *, void *);
+        };
+        proc_write_t write;
+        void *data;
+        unsigned int state_size;
+        unsigned int low_ino;
+        nlink_t nlink;
+        kuid_t uid;
+        kgid_t gid;
+        loff_t size;
+        struct proc_dir_entry *parent;
+        struct rb_root subdir;
+        struct rb_node subdir_node;
+        char *name;
+        umode_t mode;
+        u8 flags;
+        u8 namelen;
+        char inline_name[];
+} __randomize_layout;
+
+union proc_op {
+        int (*proc_get_link)(struct dentry *, struct path *);
+        int (*proc_show)(struct seq_file *m,
+                struct pid_namespace *ns, struct pid *pid,
+                struct task_struct *task);
+        const char *lsm;
+};
+
+struct proc_inode {
+        struct pid *pid;
+        unsigned int fd;
+        union proc_op op;
+        struct proc_dir_entry *pde;
+        struct ctl_table_header *sysctl;
+        struct ctl_table *sysctl_entry;
+        struct hlist_node sibling_inodes;
+        const struct proc_ns_operations *ns_ops;
+        struct inode vfs_inode;
+} __randomize_layout;
+
+static inline struct proc_inode *PROC_I(const struct inode *inode)
+{
+        return container_of(inode, struct proc_inode, vfs_inode);
+}
+
+static inline struct proc_dir_entry *PDE(const struct inode *inode)
+{
+        return PROC_I(inode)->pde;
+}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,21)  
 #include <linux/netfilter/x_tables.h>
@@ -71,13 +140,13 @@ struct t_ipt_account_stat_short {
 /* structure holding to/from statistics for single ip when table is created without --ashort switch */
 struct t_ipt_account_stats_long {
   struct t_ipt_account_stat_long src, dst;
-  struct timespec time; /* time, when statistics was last modified */
+  struct timespec64 time; /* time, when statistics was last modified */
 };
 
 /* same as above, for tables created with --ashort switch */
 struct t_ipt_account_stats_short {
   struct t_ipt_account_stat_short src, dst;
-  struct timespec time;
+  struct timespec64 time;
 };
 
 /* defines for "show" table option */
@@ -125,7 +194,7 @@ static DEFINE_MUTEX(ipt_account_mutex); /* additional checkentry protection */
 static DECLARE_MUTEX(ipt_account_mutex); /* additional checkentry protection */
 #endif
 
-static struct file_operations ipt_account_proc_fops;
+static struct proc_ops ipt_account_proc_fops;
 static struct proc_dir_entry *ipt_account_procdir;
 
 /*
@@ -205,11 +274,11 @@ ipt_account_table_init(struct t_ipt_account_info *info)
   /*
    * Create /proc/ipt_account/name entry.
    */
-  table->pde = create_proc_entry(table->name, S_IWUSR | S_IRUSR, ipt_account_procdir);
+  table->pde = proc_create(table->name, S_IWUSR | S_IRUSR, ipt_account_procdir, &ipt_account_proc_fops);
   if (!table->pde) {
     goto cleanup_stats;
   }
-  table->pde->proc_fops = &ipt_account_proc_fops;
+  table->pde->proc_ops = &ipt_account_proc_fops;
   table->pde->data = table;
   
   /*
@@ -406,7 +475,8 @@ match(const struct sk_buff *skb,
   struct t_ipt_account_table *table = info->table;
   u_int32_t address;  
   /* Get current time. */
-  struct timespec now = CURRENT_TIME_SEC;
+  struct timespec64 now;
+  ktime_get_coarse_real_ts64(&now);
   /* Default we assume no match. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,23)
   bool ret = false;
@@ -830,7 +900,8 @@ static int ipt_account_seq_show(struct seq_file *sf, void *v)
   struct t_ipt_account_table *table = pde->data;
   unsigned int *i = (unsigned int *)v;
   
-  struct timespec now = CURRENT_TIME_SEC;
+  struct timespec64 now;
+  ktime_get_coarse_real_ts64(&now);
   
   u_int32_t address = table->network + *i;
 
@@ -846,7 +917,7 @@ static int ipt_account_seq_show(struct seq_file *sf, void *v)
       return 0;
     }
     seq_printf(sf,
-        "ip = %u.%u.%u.%u bytes_src = %llu %llu %llu %llu %llu packets_src = %llu %llu %llu %llu %llu bytes_dst = %llu %llu %llu %llu %llu packets_dst = %llu %llu %llu %llu %llu time = %lu\n",
+        "ip = %u.%u.%u.%u bytes_src = %llu %llu %llu %llu %llu packets_src = %llu %llu %llu %llu %llu bytes_dst = %llu %llu %llu %llu %llu packets_dst = %llu %llu %llu %llu %llu time = %llu\n",
         HIPQUAD(address),
         l->src.b_all,
         l->src.b_tcp,
@@ -884,7 +955,7 @@ static int ipt_account_seq_show(struct seq_file *sf, void *v)
       return 0;
     }
     seq_printf(sf,
-        "ip = %u.%u.%u.%u bytes_src = %llu packets_src = %llu bytes_dst = %llu packets_dst = %llu time = %lu\n",
+        "ip = %u.%u.%u.%u bytes_src = %llu packets_src = %llu bytes_dst = %llu packets_dst = %llu time = %llu\n",
         HIPQUAD(address),
         s->src.b_all,
         s->src.p_all,
@@ -909,7 +980,7 @@ static struct seq_operations ipt_account_seq_ops = {
 static ssize_t ipt_account_proc_write(struct file *file, const char __user *input, size_t size, loff_t *ofs)
 {
   char *buffer;
-  struct proc_dir_entry *pde = PDE(file->f_dentry->d_inode);
+  struct proc_dir_entry *pde = PDE(file->f_path.dentry->d_inode);
   struct t_ipt_account_table *table = pde->data;
 
   u_int32_t o[4], ip;
@@ -982,7 +1053,7 @@ static ssize_t ipt_account_proc_write(struct file *file, const char __user *inpu
   } else if (!strncmp(buffer, "time=dst\n", 9)) {
     table->timesrc = 0;
     table->timedst = 1;
-  } else if (!table->shortlisting && sscanf(buffer, "ip = %u.%u.%u.%u bytes_src = %llu %llu %llu %llu %llu packets_src = %llu %llu %llu %llu %llu bytes_dst = %llu %llu %llu %llu %llu packets_dst = %llu %llu %llu %llu %llu time = %lu",        
+  } else if (!table->shortlisting && sscanf(buffer, "ip = %u.%u.%u.%u bytes_src = %llu %llu %llu %llu %llu packets_src = %llu %llu %llu %llu %llu bytes_dst = %llu %llu %llu %llu %llu packets_dst = %llu %llu %llu %llu %llu time = %llu",        
         &o[0], &o[1], &o[2], &o[3],
         &l.src.b_all, &l.src.b_tcp, &l.src.b_udp, &l.src.b_icmp, &l.src.b_other,
         &l.src.p_all, &l.src.p_tcp, &l.src.p_udp, &l.src.p_icmp, &l.src.p_other,
@@ -999,12 +1070,12 @@ static ssize_t ipt_account_proc_write(struct file *file, const char __user *inpu
       /*
        * Ignore user input time. Set current time.
        */
-      l.time = CURRENT_TIME_SEC;
+      ktime_get_coarse_real_ts64(&l.time);
       write_lock_bh(&table->stats_lock);
       table->stats.l[ip - table->network] = l;
       write_unlock_bh(&table->stats_lock);
     }
-  } else if (table->shortlisting && sscanf(buffer, "ip = %u.%u.%u.%u bytes_src = %llu packets_src = %llu bytes_dst = %llu packets_dst = %llu time = %lu\n", 
+  } else if (table->shortlisting && sscanf(buffer, "ip = %u.%u.%u.%u bytes_src = %llu packets_src = %llu bytes_dst = %llu packets_dst = %llu time = %llu\n", 
         &o[0], &o[1], &o[2], &o[3], 
         &s.src.b_all, 
         &s.src.p_all, 
@@ -1017,7 +1088,7 @@ static ssize_t ipt_account_proc_write(struct file *file, const char __user *inpu
      */
     ip = o[0] << 24 | o[1] << 16 | o[2] << 8 | o[3];    
     if ((u_int32_t)(ip & table->netmask) == (u_int32_t)table->network) {
-      s.time = CURRENT_TIME_SEC;
+      ktime_get_coarse_real_ts64(&s.time);
       write_lock_bh(&table->stats_lock);
       table->stats.s[ip - table->network] = s;
       write_unlock_bh(&table->stats_lock);
@@ -1063,13 +1134,12 @@ static int ipt_account_proc_release(struct inode *inode, struct file *file)
   return ret;
 }
 
-static struct file_operations ipt_account_proc_fops = {
-  .owner = THIS_MODULE,
-  .open = ipt_account_proc_open,
-  .read = seq_read,
-  .write = ipt_account_proc_write,
-  .llseek = seq_lseek,
-  .release = ipt_account_proc_release
+static struct proc_ops ipt_account_proc_fops = {
+  .proc_open = ipt_account_proc_open,
+  .proc_read = seq_read,
+  .proc_write = ipt_account_proc_write,
+  .proc_lseek = seq_lseek,
+  .proc_release = ipt_account_proc_release
 };
 
 /*
